@@ -51,7 +51,7 @@ proc ad_add_decimation_filter {name filter_rate n_chan parallel_paths \
       Data_Fractional_Bits 15 \
       Coefficient_Sets 1 \
       Coefficient_Sign Signed \
-      Coefficient_Structure Inferred \
+      Coefficient_Structure Symmetric \
       Coefficient_Width 16 \
       ColumnConfig 5 \
       Filter_Architecture Systolic_Multiply_Accumulate \
@@ -159,7 +159,7 @@ proc ad_add_interpolation_filter {name filter_rate n_chan parallel_paths \
       Data_Fractional_Bits 15 \
       Coefficient_Sets 1 \
       Coefficient_Sign Signed \
-      Coefficient_Structure Inferred \
+      Coefficient_Structure Symmetric \
       Coefficient_Width 16 \
       ColumnConfig 5 \
       Filter_Architecture Systolic_Multiply_Accumulate \

@@ -49,9 +49,12 @@ ad_ip_parameter sys_ps7 CONFIG.PCW_PACKAGE_NAME clg225
 ad_ip_parameter sys_ps7 CONFIG.PCW_USE_S_AXI_HP1 1
 ad_ip_parameter sys_ps7 CONFIG.PCW_USE_S_AXI_HP2 1
 ad_ip_parameter sys_ps7 CONFIG.PCW_EN_CLK1_PORT 1
+ad_ip_parameter sys_ps7 CONFIG.PCW_EN_CLK2_PORT 1
 ad_ip_parameter sys_ps7 CONFIG.PCW_EN_RST1_PORT 1
+ad_ip_parameter sys_ps7 CONFIG.PCW_EN_RST2_PORT 1
 ad_ip_parameter sys_ps7 CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ 100.0
 ad_ip_parameter sys_ps7 CONFIG.PCW_FPGA1_PERIPHERAL_FREQMHZ 200.0
+ad_ip_parameter sys_ps7 CONFIG.PCW_FPGA2_PERIPHERAL_FREQMHZ 50.0
 ad_ip_parameter sys_ps7 CONFIG.PCW_GPIO_EMIO_GPIO_ENABLE 1
 ad_ip_parameter sys_ps7 CONFIG.PCW_GPIO_EMIO_GPIO_IO 18
 ad_ip_parameter sys_ps7 CONFIG.PCW_SPI1_PERIPHERAL_ENABLE 0
@@ -111,10 +114,18 @@ ad_ip_parameter axi_spi CONFIG.C_SCK_RATIO 8
 
 ad_connect  sys_cpu_clk sys_ps7/FCLK_CLK0
 ad_connect  sys_200m_clk sys_ps7/FCLK_CLK1
+ad_connect  sys_50m_clk sys_ps7/FCLK_CLK2
 ad_connect  sys_cpu_reset sys_rstgen/peripheral_reset
 ad_connect  sys_cpu_resetn sys_rstgen/peripheral_aresetn
 ad_connect  sys_cpu_clk sys_rstgen/slowest_sync_clk
 ad_connect  sys_rstgen/ext_reset_in sys_ps7/FCLK_RESET0_N
+
+# 50 MHz reset generator for AES
+ad_ip_instance proc_sys_reset sys_rstgen_50m
+ad_ip_parameter sys_rstgen_50m CONFIG.C_EXT_RST_WIDTH 1
+ad_connect sys_50m_clk sys_rstgen_50m/slowest_sync_clk
+ad_connect sys_rstgen_50m/ext_reset_in sys_ps7/FCLK_RESET2_N
+ad_connect sys_50m_resetn sys_rstgen_50m/peripheral_aresetn
 
 # interface connections
 
@@ -197,8 +208,11 @@ create_bd_port -dir I up_txnrx
 ad_ip_instance axi_ad9361 axi_ad9361
 ad_ip_parameter axi_ad9361 CONFIG.ID 0
 ad_ip_parameter axi_ad9361 CONFIG.CMOS_OR_LVDS_N 1
-ad_ip_parameter axi_ad9361 CONFIG.MODE_1R1T 0
+ad_ip_parameter axi_ad9361 CONFIG.MODE_1R1T 1
 ad_ip_parameter axi_ad9361 CONFIG.ADC_INIT_DELAY 21
+
+# disable DDS to save some DSP blocks and some luts as it prob won't be used in the final design
+ad_ip_parameter axi_ad9361 CONFIG.DAC_DDS_DISABLE 1 
 
 ad_ip_instance axi_dmac axi_ad9361_dac_dma
 ad_ip_parameter axi_ad9361_dac_dma CONFIG.DMA_TYPE_SRC 0
@@ -352,6 +366,35 @@ ad_cpu_interconnect 0x7C420000 axi_ad9361_dac_dma
 ad_cpu_interconnect 0x7C430000 axi_spi
 ad_cpu_interconnect 0x7C440000 axi_tdd_0
 
+# AES accelerator on separate GP1 port at 50 MHz
+ad_ip_parameter sys_ps7 CONFIG.PCW_USE_M_AXI_GP1 1
+ad_ip_instance axi_aes axi_aes_0
+
+# Create AXI Interconnect for GP1 (converts AXI3 to AXI4-Lite)
+ad_ip_instance axi_interconnect axi_gp1_interconnect
+ad_ip_parameter axi_gp1_interconnect CONFIG.NUM_MI 1
+
+# Connect GP1 to interconnect (AXI3 side)
+ad_connect sys_50m_clk sys_ps7/M_AXI_GP1_ACLK
+ad_connect sys_ps7/M_AXI_GP1 axi_gp1_interconnect/S00_AXI
+ad_connect sys_50m_clk axi_gp1_interconnect/ACLK
+ad_connect sys_50m_clk axi_gp1_interconnect/S00_ACLK
+ad_connect sys_50m_clk axi_gp1_interconnect/M00_ACLK
+ad_connect sys_50m_resetn axi_gp1_interconnect/ARESETN
+ad_connect sys_50m_resetn axi_gp1_interconnect/S00_ARESETN
+ad_connect sys_50m_resetn axi_gp1_interconnect/M00_ARESETN
+
+# Connect AES to interconnect (AXI4-Lite side)
+ad_connect axi_gp1_interconnect/M00_AXI axi_aes_0/s_axi
+ad_connect sys_50m_clk axi_aes_0/s_axi_aclk
+ad_connect sys_50m_resetn axi_aes_0/s_axi_aresetn
+
+# Address mapping for AES on GP1 (0x80000000 is GP1 base)
+create_bd_addr_seg -range 0x10000 -offset 0x80000000 \
+                    [get_bd_addr_spaces sys_ps7/Data] \
+                    [get_bd_addr_segs axi_aes_0/s_axi/axi_lite] \
+                    SEG_axi_aes_0
+
 ad_ip_parameter sys_ps7 CONFIG.PCW_USE_S_AXI_HP1 {1}
 ad_connect sys_cpu_clk sys_ps7/S_AXI_HP1_ACLK
 ad_connect axi_ad9361_adc_dma/m_dest_axi sys_ps7/S_AXI_HP1
@@ -380,4 +423,5 @@ ad_connect sys_cpu_resetn axi_ad9361_dac_dma/m_src_axi_aresetn
 ad_cpu_interrupt ps-13 mb-13 axi_ad9361_adc_dma/irq
 ad_cpu_interrupt ps-12 mb-12 axi_ad9361_dac_dma/irq
 ad_cpu_interrupt ps-11 mb-11 axi_spi/ip2intc_irpt
+ad_cpu_interrupt ps-10 mb-10 axi_aes_0/irq
 
