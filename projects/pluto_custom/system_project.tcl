@@ -15,6 +15,13 @@ adi_project_files pluto [list \
   "$ad_hdl_dir/library/common/ad_iobuf.v"]
 
 set_property is_enabled false [get_files  *system_sys_ps7_0.xdc]
+
+# Enable post-placement physical optimisation to allow Vivado to replicate
+# high-fanout nets (e.g. the fo=2998 reset net that causes marginal setup
+# violations at 100 MHz).
+set_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveFanoutOpt [get_runs impl_1]
+
 adi_project_run pluto
 source $ad_hdl_dir/library/axi_ad9361/axi_ad9361_delay.tcl
 

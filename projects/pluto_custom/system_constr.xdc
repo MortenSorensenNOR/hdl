@@ -85,11 +85,23 @@ create_clock -name rx_clk -period  16.27 [get_ports rx_clk_in]
 
 create_clock -name clk_fpga_0 -period 10 [get_pins "i_system_wrapper/system_i/sys_ps7/inst/PS7_i/FCLKCLK[0]"]
 create_clock -name clk_fpga_1 -period  5 [get_pins "i_system_wrapper/system_i/sys_ps7/inst/PS7_i/FCLKCLK[1]"]
+create_clock -name clk_fpga_2 -period 20 [get_pins "i_system_wrapper/system_i/sys_ps7/inst/PS7_i/FCLKCLK[2]"]
 
 create_clock -name spi0_clk      -period 40   [get_pins -hier */EMIOSPI0SCLKO]
 
 set_input_jitter clk_fpga_0 0.3
 set_input_jitter clk_fpga_1 0.15
+
+# AES accelerator runs on clk_fpga_2 (50 MHz) and is fully isolated from the
+# SDR data path via the GP1 AXI port — declare it asynchronous so the timing
+# engine does not attempt to close cross-domain paths between the two worlds.
+# Guard with -quiet check: during synthesis the PS7 pin isn't resolved yet so
+# clk_fpga_2 doesn't exist, which would raise a spurious critical warning.
+if {[llength [get_clocks -quiet clk_fpga_2]] > 0} {
+  set_clock_groups -asynchronous \
+    -group [get_clocks clk_fpga_2] \
+    -group [get_clocks {clk_fpga_0 clk_fpga_1 rx_clk spi0_clk}]
+}
 
 set_property IOSTANDARD LVCMOS18 [get_ports *fixed_io_mio*]
 set_property SLEW SLOW [get_ports *fixed_io_mio*]
@@ -220,4 +232,10 @@ set_property PACKAGE_PIN F2 [get_ports ddr_dqs_n[1]]
 
 set_false_path -from [get_pins {i_system_wrapper/system_i/axi_ad9361/inst/i_rx/i_up_adc_common/up_adc_gpio_out_int_reg[0]/C}]
 set_false_path -from [get_pins {i_system_wrapper/system_i/axi_ad9361/inst/i_tx/i_up_dac_common/up_dac_gpio_out_int_reg[0]/C}]
+
+# TDD sync CDC: tdd_channel_1 and tdd_channel_2 cross from rx_clk to sys_cpu_clk
+# via sync_bits.  The first synchronizer stage is intentionally allowed to
+# metastabilize.
+set_false_path -to [get_cells -hierarchical -filter {NAME =~ *tdd_adc_sync_cdc*cdc_sync_stage1_reg*}]
+set_false_path -to [get_cells -hierarchical -filter {NAME =~ *tdd_dac_sync_cdc*cdc_sync_stage1_reg*}]
 

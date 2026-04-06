@@ -254,42 +254,169 @@ ad_connect  axi_ad9361/tdd_sync GND
 ad_connect  sys_200m_clk axi_ad9361/delay_clk
 ad_connect  axi_ad9361/l_clk axi_ad9361/clk
 
-# RX path - direct connection from AD9361 to cpack to DMA
-ad_connect axi_ad9361/l_clk rx_cpack/clk
-ad_connect axi_ad9361/rst rx_cpack/reset
+# RX path - AD9361 (l_clk domain) → CDC → RRC filter (sys_cpu_clk) → cpack → DMA
+#
+# The AD9361 in CMOS 1R1T DDR mode runs l_clk at the sample rate (~2.4 MHz),
+# leaving only 1 FPGA clock cycle per sample. A 65-tap systolic FIR would need
+# ~9 cycles per sample, so the filter runs at sys_cpu_clk (100 MHz, ratio ≈ 41.7)
+# and an AXI-Stream clock converter bridges the two domains. rx_cpack and the ADC
+# DMA write path also move to sys_cpu_clk to stay in the same domain as the filter.
 
-ad_connect axi_ad9361/adc_enable_i0 rx_cpack/enable_0
-ad_connect axi_ad9361/adc_valid_i0 rx_cpack/fifo_wr_en
-ad_connect axi_ad9361/adc_data_i0 rx_cpack/fifo_wr_data_0
-ad_connect axi_ad9361/adc_enable_q0 rx_cpack/enable_1
-ad_connect axi_ad9361/adc_data_q0 rx_cpack/fifo_wr_data_1
-ad_connect axi_ad9361/adc_enable_i1 rx_cpack/enable_2
-ad_connect axi_ad9361/adc_data_i1 rx_cpack/fifo_wr_data_2
-ad_connect axi_ad9361/adc_enable_q1 rx_cpack/enable_3
-ad_connect axi_ad9361/adc_data_q1 rx_cpack/fifo_wr_data_3
+# --- active-low reset in l_clk domain (for CDC slave aresetn) ---
+ad_ip_instance util_vector_logic rx_rst_inv [list C_OPERATION {not} C_SIZE 1]
+ad_connect rx_rst_inv/Op1 axi_ad9361/rst
+
+# --- pack {Q[15:0], I[15:0]} → 32-bit AXI-stream word (combinational) ---
+ad_ip_instance xlconcat rx_iq_concat [list NUM_PORTS 2 IN0_WIDTH 16 IN1_WIDTH 16]
+ad_connect axi_ad9361/adc_data_i0 rx_iq_concat/In0
+ad_connect axi_ad9361/adc_data_q0 rx_iq_concat/In1
+
+# --- AXI-Stream clock converter: l_clk → sys_cpu_clk ---
+# FIFO depth 32 is ample (sys_cpu_clk drains ~18× faster than l_clk produces).
+ad_ip_instance axis_clock_converter rx_adc_cdc [list TDATA_NUM_BYTES 4]
+ad_connect axi_ad9361/l_clk    rx_adc_cdc/s_axis_aclk
+ad_connect rx_rst_inv/Res      rx_adc_cdc/s_axis_aresetn
+ad_connect sys_cpu_clk         rx_adc_cdc/m_axis_aclk
+ad_connect sys_cpu_resetn      rx_adc_cdc/m_axis_aresetn
+ad_connect rx_iq_concat/dout   rx_adc_cdc/s_axis_tdata
+ad_connect axi_ad9361/adc_valid_i0 rx_adc_cdc/s_axis_tvalid
+# s_axis_tready from the CDC is ignored by AD9361 (push-only interface);
+# the FIFO never fills because sys_cpu_clk >> l_clk.
+
+# --- RRC FIR filter at sys_cpu_clk ---
+# Instantiated directly (not wrapped) so Vivado BD can apply fir_compiler's
+# clock-interface constraints; a wrapper IP breaks clock propagation and causes
+# "registers with no clocks" timing failures.
+# ColumnConfig=4: ceil(33 symmetric taps / 4) = 9 MAC cycles/sample < 41.7 available.
+# DSP count: 4 columns × 2 paths = 8 DSP48E1 slices.
+ad_ip_instance fir_compiler rx_rrc_fir [list \
+  Filter_Type                  Single_Rate \
+  Decimation_Rate              1 \
+  Interpolation_Rate           1 \
+  Number_Paths                 2 \
+  Clock_Frequency              100 \
+  Sample_Frequency             2.4 \
+  RateSpecification            Frequency_Specification \
+  CoefficientSource            COE_File \
+  Coefficient_File             $ad_hdl_dir/library/util_rrc_fir/coefile_rrc.coe \
+  Coefficient_Fractional_Bits  0 \
+  Data_Fractional_Bits         15 \
+  Coefficient_Sets             1 \
+  Coefficient_Sign             Signed \
+  Coefficient_Structure        Symmetric \
+  Coefficient_Width            16 \
+  ColumnConfig                 4 \
+  Filter_Architecture          Systolic_Multiply_Accumulate \
+  Number_Channels              1 \
+  Output_Rounding_Mode         Symmetric_Rounding_to_Zero \
+  Output_Width                 16 \
+  Quantization                 Integer_Coefficients \
+  S_DATA_Has_FIFO              true \
+  M_DATA_Has_TREADY            false \
+]
+ad_connect sys_cpu_clk              rx_rrc_fir/aclk
+ad_connect rx_adc_cdc/m_axis_tdata  rx_rrc_fir/s_axis_data_tdata
+ad_connect rx_adc_cdc/m_axis_tvalid rx_rrc_fir/s_axis_data_tvalid
+ad_connect rx_rrc_fir/s_axis_data_tready rx_adc_cdc/m_axis_tready
+
+# --- unpack filtered {Q[15:0], I[15:0]} ---
+ad_ip_instance xlslice rx_fir_i_slice [list DIN_WIDTH 32 DIN_FROM 15 DIN_TO 0]
+ad_ip_instance xlslice rx_fir_q_slice [list DIN_WIDTH 32 DIN_FROM 31 DIN_TO 16]
+ad_connect rx_rrc_fir/m_axis_data_tdata rx_fir_i_slice/Din
+ad_connect rx_rrc_fir/m_axis_data_tdata rx_fir_q_slice/Din
+
+# --- rx_cpack at sys_cpu_clk ---
+# In 1R1T mode channels 2/3 (i1, q1) are never enabled; tie them to ground.
+ad_connect sys_cpu_clk  rx_cpack/clk
+ad_connect sys_cpu_reset rx_cpack/reset
+
+ad_connect VCC           rx_cpack/enable_0
+ad_connect rx_rrc_fir/m_axis_data_tvalid rx_cpack/fifo_wr_en
+ad_connect rx_fir_i_slice/Dout rx_cpack/fifo_wr_data_0
+ad_connect VCC           rx_cpack/enable_1
+ad_connect rx_fir_q_slice/Dout rx_cpack/fifo_wr_data_1
+ad_connect GND           rx_cpack/enable_2
+ad_connect GND           rx_cpack/fifo_wr_data_2
+ad_connect GND           rx_cpack/enable_3
+ad_connect GND           rx_cpack/fifo_wr_data_3
 
 ad_connect axi_ad9361_adc_dma/fifo_wr rx_cpack/packed_fifo_wr
-ad_connect rx_cpack/fifo_wr_overflow axi_ad9361/adc_dovf
+# adc_dovf driven from cpack overflow; cpack is now in sys_cpu_clk domain so
+# this crosses to l_clk on the AD9361 side — tie off to avoid undriven port.
+ad_connect GND axi_ad9361/adc_dovf
 
-# TX path - direct connection from DMA to upack to AD9361
+# TX path - DMA (sys_cpu_clk) → TX RRC FIR (sys_cpu_clk) → CDC (sys_cpu_clk → l_clk) → upack → AD9361
+#
+# Mirrors the RX path in reverse.  Moving the DMA m_axis to sys_cpu_clk gives
+# the FIR ~41 cycles per sample (100 MHz / 2.4 MHz), the same headroom used on
+# the RX side.  A CDC bridges back to l_clk for the AD9361 DAC interface.
+#
+# The ADI DMAC only exposes m_axis as a complete AXI4-Stream interface (no
+# individual signal pins), so the FIR is configured with Number_Paths=4 to
+# accept the full 64-bit {Q1[15:0],I1[15:0],Q0[15:0],I0[15:0]} word directly.
+# In 1R1T mode I1/Q1 are always zero from the DMA, so their filtered outputs
+# are also zero — the 64-bit format is preserved through the filter unchanged
+# except for the RRC shaping on the active I0/Q0 channels.
+# DSP count: ceil(33/4)=9 MAC stages × 4 paths × 4 columns = 16 DSP48E1.
+
+# --- TX RRC FIR filter at sys_cpu_clk (64-bit, Number_Paths=4) ---
+ad_ip_instance fir_compiler tx_rrc_fir [list \
+  Filter_Type                  Single_Rate \
+  Decimation_Rate              1 \
+  Interpolation_Rate           1 \
+  Number_Paths                 4 \
+  Clock_Frequency              100 \
+  Sample_Frequency             2.4 \
+  RateSpecification            Frequency_Specification \
+  CoefficientSource            COE_File \
+  Coefficient_File             $ad_hdl_dir/library/util_rrc_fir/coefile_rrc.coe \
+  Coefficient_Fractional_Bits  0 \
+  Data_Fractional_Bits         15 \
+  Coefficient_Sets             1 \
+  Coefficient_Sign             Signed \
+  Coefficient_Structure        Symmetric \
+  Coefficient_Width            16 \
+  ColumnConfig                 4 \
+  Filter_Architecture          Systolic_Multiply_Accumulate \
+  Number_Channels              1 \
+  Output_Rounding_Mode         Symmetric_Rounding_to_Zero \
+  Output_Width                 16 \
+  Quantization                 Integer_Coefficients \
+  S_DATA_Has_FIFO              true \
+  M_DATA_Has_TREADY            true \
+]
+ad_connect sys_cpu_clk                    tx_rrc_fir/aclk
+ad_connect axi_ad9361_dac_dma/m_axis      tx_rrc_fir/S_AXIS_DATA
+
+# --- AXI-Stream clock converter: sys_cpu_clk → l_clk (64-bit) ---
+ad_ip_instance axis_clock_converter tx_dac_cdc [list TDATA_NUM_BYTES 8]
+ad_connect sys_cpu_clk       tx_dac_cdc/s_axis_aclk
+ad_connect sys_cpu_resetn    tx_dac_cdc/s_axis_aresetn
+ad_connect axi_ad9361/l_clk  tx_dac_cdc/m_axis_aclk
+ad_connect rx_rst_inv/Res    tx_dac_cdc/m_axis_aresetn
+ad_connect tx_rrc_fir/m_axis_data_tdata   tx_dac_cdc/s_axis_tdata
+ad_connect tx_rrc_fir/m_axis_data_tvalid  tx_dac_cdc/s_axis_tvalid
+ad_connect tx_dac_cdc/s_axis_tready       tx_rrc_fir/m_axis_data_tready
+
+# --- tx_upack and AD9361 DAC remain at l_clk ---
 ad_connect axi_ad9361/l_clk tx_upack/clk
-ad_connect axi_ad9361/rst tx_upack/reset
+ad_connect axi_ad9361/rst   tx_upack/reset
 
 ad_connect axi_ad9361/dac_enable_i0 tx_upack/enable_0
-ad_connect axi_ad9361/dac_valid_i0 tx_upack/fifo_rd_en
-ad_connect axi_ad9361/dac_data_i0 tx_upack/fifo_rd_data_0
+ad_connect axi_ad9361/dac_valid_i0  tx_upack/fifo_rd_en
+ad_connect axi_ad9361/dac_data_i0   tx_upack/fifo_rd_data_0
 ad_connect axi_ad9361/dac_enable_q0 tx_upack/enable_1
-ad_connect axi_ad9361/dac_data_q0 tx_upack/fifo_rd_data_1
+ad_connect axi_ad9361/dac_data_q0   tx_upack/fifo_rd_data_1
 ad_connect axi_ad9361/dac_enable_i1 tx_upack/enable_2
-ad_connect axi_ad9361/dac_data_i1 tx_upack/fifo_rd_data_2
+ad_connect axi_ad9361/dac_data_i1   tx_upack/fifo_rd_data_2
 ad_connect axi_ad9361/dac_enable_q1 tx_upack/enable_3
-ad_connect axi_ad9361/dac_data_q1 tx_upack/fifo_rd_data_3
+ad_connect axi_ad9361/dac_data_q1   tx_upack/fifo_rd_data_3
 
-ad_connect tx_upack/s_axis axi_ad9361_dac_dma/m_axis
+ad_connect tx_dac_cdc/M_AXIS tx_upack/s_axis
 ad_connect tx_upack/fifo_rd_underflow axi_ad9361/dac_dunf
 
-ad_connect axi_ad9361/l_clk axi_ad9361_adc_dma/fifo_wr_clk
-ad_connect axi_ad9361/l_clk axi_ad9361_dac_dma/m_axis_aclk
+ad_connect sys_cpu_clk axi_ad9361_adc_dma/fifo_wr_clk
+ad_connect sys_cpu_clk axi_ad9361_dac_dma/m_axis_aclk
 
 # External TDD
 set TDD_CHANNEL_CNT 3
@@ -318,8 +445,22 @@ ad_connect logic_inv/Res  axi_tdd_0/resetn
 ad_connect axi_ad9361/l_clk axi_tdd_0/clk
 ad_connect axi_tdd_0/sync_in tdd_ext_sync
 ad_connect axi_tdd_0/tdd_channel_0 txdata_o
-ad_connect axi_tdd_0/tdd_channel_1 axi_ad9361_adc_dma/sync
-ad_connect axi_tdd_0/tdd_channel_2 axi_ad9361_dac_dma/sync
+# tdd_channel_1 drives adc_dma/sync, which is in sys_cpu_clk domain after the
+# cpack/DMA move.  TDD runs on rx_clk (l_clk), so synchronize the signal.
+add_files -norecurse $ad_hdl_dir/library/util_cdc/sync_bits.v
+create_bd_cell -type module -reference sync_bits tdd_adc_sync_cdc
+ad_connect sys_cpu_clk tdd_adc_sync_cdc/out_clk
+ad_connect VCC         tdd_adc_sync_cdc/out_resetn
+ad_connect axi_tdd_0/tdd_channel_1 tdd_adc_sync_cdc/in_bits
+ad_connect tdd_adc_sync_cdc/out_bits axi_ad9361_adc_dma/sync
+
+# tdd_channel_2 → dac_dma/sync: TDD runs on rx_clk (l_clk), but the DAC DMA
+# sync port is sampled in the sys_cpu_clk (clk_fpga_0) domain — CDC required.
+create_bd_cell -type module -reference sync_bits tdd_dac_sync_cdc
+ad_connect sys_cpu_clk tdd_dac_sync_cdc/out_clk
+ad_connect VCC         tdd_dac_sync_cdc/out_resetn
+ad_connect axi_tdd_0/tdd_channel_2 tdd_dac_sync_cdc/in_bits
+ad_connect tdd_dac_sync_cdc/out_bits axi_ad9361_dac_dma/sync
 
 # interconnects
 
